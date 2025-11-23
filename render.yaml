@@ -1,9 +1,9 @@
 services:
   - type: web
-    name: lightning-dialer
+    name: dialer
     env: ruby
     plan: starter
-    buildCommand: gem install bundler -v '2.1.4' && bundle _2.1.4_ install
+    buildCommand: gem install bundler -v '2.1.4' && rm -f Gemfile.lock && bundle _2.1.4_ install
     startCommand: bundle exec puma -C - -e production -p $PORT
     envVars:
       - key: RACK_ENV
