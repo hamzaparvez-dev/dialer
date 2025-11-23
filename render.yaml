@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: lightning-dialer
+    env: ruby
+    plan: starter
+    buildCommand: bundle install
+    startCommand: bundle exec puma -C - -e production -p $PORT
+    envVars:
+      - key: RACK_ENV
+        value: production
+      - key: twilio_account_sid
+        sync: false
+      - key: twilio_account_token
+        sync: false
+      - key: twilio_app_id
+        sync: false
+      - key: twilio_caller_id
+        sync: false
+      - key: twilio_queue_name
+        value: CustomerService
+      - key: twilio_dqueue_url
+        # IMPORTANT: After deployment, update this to your actual Render service URL
+        # Format: https://your-service-name.onrender.com/voice
+        # You can find your service URL in the Render dashboard after deployment
+      - key: anycallerid
+        value: none
+        # Set to "inline" if you want agents to set their own caller ID
+      - key: SALESFORCE_WEBHOOK_URL
+        sync: false
+        # Optional: Salesforce integration webhook URL
+        # Leave empty if not using Salesforce integration
+

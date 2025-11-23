@@ -3,7 +3,6 @@ require 'sinatra'
 require 'sinatra-websocket'
 require 'twilio-ruby'
 require 'json/ext' # required for .to_json
-require 'mongo'
 require 'logger'
 
 logger = Logger.new(STDOUT)
@@ -23,22 +22,38 @@ app_id =  ENV['twilio_app_id']
 caller_id = ENV['twilio_caller_id']  #number your agents will click2dialfrom
 qname = ENV['twilio_queue_name']
 dqueueurl = ENV['twilio_dqueue_url']
-mongohqdbstring = ENV['MONGODB_URI']
-anycallerid = ENV['anycallerid'] || "none"   #If you set this in your ENV anycallerid=inline the callerid box will be displayed to users.  To use anycallerid (agents set their own caller id), your Twilio Account must be provisioned.  So default is false, agents wont' be able to use any callerid. 
+anycallerid = ENV['anycallerid'] || "none"   #If you set this in your ENV anycallerid=inline the callerid box will be displayed to users.  To use anycallerid (agents set their own caller id), your Twilio Account must be provisioned.  So default is false, agents wont' be able to use any callerid.
+salesforce_webhook_url = ENV['SALESFORCE_WEBHOOK_URL'] # Optional: Salesforce integration webhook URL 
 
-########### DB Setup  ###################
+########### In-Memory Storage Setup  ###################
+# Using in-memory storage instead of MongoDB for simplicity
 configure do
-  db = URI.parse(mongohqdbstring)
-  db_name = db.path.gsub(/^\//, '')   
-  @conn = Mongo::Connection.new(db.host, db.port).db(db_name)
-  @conn.authenticate(db.user, db.password) unless (db.user.nil? || db.user.nil?)
-  set :mongo_connection, @conn
+  # Store agent data in memory: { agent_name => { status, readytime, currentclientcount, callerid } }
+  set :agents, {}
+  # Store call data in memory: { call_sid => { agent, status } }
+  set :calls, {}
+  logger.info("Using in-memory storage (no database required)")
 end
-# agents will be stored in 'agents' collection
-mongoagents = settings.mongo_connection['agents']
-mongocalls = settings.mongo_connection['calls']
 
-##### end of db config #######
+# Helper methods for agent storage
+def get_agent(agent_name)
+  settings.agents[agent_name] || { status: "LOGGEDOUT", readytime: Time.now.to_f, currentclientcount: 0, callerid: caller_id }
+end
+
+def update_agent(agent_name, updates)
+  current = get_agent(agent_name)
+  settings.agents[agent_name] = current.merge(updates)
+end
+
+def get_call(call_sid)
+  settings.calls[call_sid]
+end
+
+def update_call(call_sid, data)
+  settings.calls[call_sid] = data
+end
+
+##### end of storage config #######
 
 
 ################ TWILLO CONFIG ################
@@ -126,8 +141,13 @@ get '/websocket' do
       querystring = ws.request["query"]
       clientname = querystring.split(/\=/)[1]
       logger.info("Client #{clientname} connected from Websockets")
-      #update database with list of clients
-      mongoagents.update({_id: clientname} , { "$set" =>   {status: "LoggingIn",readytime: Time.now.to_f  },  "$inc"  =>  {:currentclientcount => 1}} , {upsert: true})
+      #update agent status in memory
+      agent = get_agent(clientname)
+      update_agent(clientname, {
+        status: "LoggingIn",
+        readytime: Time.now.to_f,
+        currentclientcount: (agent[:currentclientcount] || 0) + 1
+      })
       settings.sockets << ws     
     end
 
@@ -147,15 +167,13 @@ get '/websocket' do
       settings.sockets.delete(ws)
 
       ###Reduce count of websocket connections for this client
-      mongoagents.update({_id: clientname} , {  "$inc" => {currentclientcount: -1}});
-
-      #If this username has 0 clients, change him to logged out in the database.
-      mongonewclientcount = mongoagents.find_one({ _id: clientname})
-      logger.debug("updating mongonewclientcount = #{mongonewclientcount}")
-      if mongonewclientcount  
-        if mongonewclientcount["currentclientcount"] < 1
-           mongoagents.update({_id: clientname} , {  "$set" => {status: "LOGGEDOUT"}});
-        end
+      agent = get_agent(clientname)
+      new_count = (agent[:currentclientcount] || 1) - 1
+      update_agent(clientname, { currentclientcount: new_count })
+      
+      #If this username has 0 clients, change him to logged out
+      if new_count < 1
+        update_agent(clientname, { status: "LOGGEDOUT" })
       end
     end  ### End Websocket close
 
@@ -177,7 +195,7 @@ post '/voice' do
     callerid = params[:Caller]  
     addtoq = 0
 
-    bestclient = getlongestidle(true, mongoagents)
+    bestclient = getlongestidle(true)
     if bestclient
        logger.debug("Routing incomming voice call to best agent = #{bestclient}")
        client_name = bestclient
@@ -193,11 +211,17 @@ post '/voice' do
             r.Enqueue(dialqueue)
         else      #send to best agent   
            # r.Dial(:timeout=>"10", :action=>"/handledialcallstatus", :callerId => callerid)  do |d|
-           r.Dial(:timeout=>"10",:record=>"record-from-answer", :callerId => callerid, :method => "GET", :action=>"http://yardidhruv-touchpoint.cs62.force.com/Click2Dial/services/apexrest/TwilioCalls/TouchPoint?FromNumber=#{callerid}")  do |d| 
+           dial_options = {:timeout=>"10", :record=>"record-from-answer", :callerId => callerid}
+           if salesforce_webhook_url
+             dial_options[:method] = "GET"
+             dial_options[:action] = "#{salesforce_webhook_url}?FromNumber=#{callerid}"
+           else
+             dial_options[:action] = "/handledialcallstatus"
+           end
+           r.Dial(dial_options) do |d| 
                 logger.debug("dialing client #{client_name}")
 
-                agentinfo = { _id: sid, agent: client_name, status: "Ringing" }
-                sidinsert = mongocalls.update({_id: sid},  agentinfo, {upsert: true})
+                update_call(sid, { agent: client_name, status: "Ringing" })
 
                 d.Client client_name   
             end
@@ -205,7 +229,6 @@ post '/voice' do
     end
     logger.debug("Response text for /voice post = #{response.text}")
     #update clients with new info, route calls if any
-    #getqueueinfo(mongoagents,logger, queueid, addtoq)
     response.text
 end
 
@@ -215,11 +238,9 @@ post '/handledialcallstatus' do
   sid = params[:CallSid]
 
   if params['DialCallStatus'] == "no-answer"
-    mongosidinfo = {}
-    mongosidinfo = mongocalls.find_one ({_id: sid})
-    if mongosidinfo
-        mongoagent = mongosidinfo["agent"]   
-        mongoagents.update({_id: mongoagent}, { "$set" => {status:  "Missed"}}, {upsert: false})
+    call_info = get_call(sid)
+    if call_info && call_info[:agent]
+      update_agent(call_info[:agent], { status: "Missed" })
     end
 
     response = Twilio::TwiML::Response.new do |r| 
@@ -254,7 +275,12 @@ post '/dial' do
         # outboudn dialing (from client) must have a :callerId 
         # Yet to Recording feature and Callduration tracking 
        # r.Dial :callerId => dial_id do |d|
-        r.Dial(:record=>"record-from-answer", :callerId => dial_id, :method => "GET", :action=>"http://yardidhruv-touchpoint.cs62.force.com/Click2Dial/services/apexrest/TwilioCalls/TouchPoint?ToNumber=#{number}")  do |d|
+        dial_options = {:record=>"record-from-answer", :callerId => dial_id}
+        if salesforce_webhook_url
+          dial_options[:method] = "GET"
+          dial_options[:action] = "#{salesforce_webhook_url}?ToNumber=#{number}"
+        end
+        r.Dial(dial_options) do |d|
           d.Number number
         end
     end
@@ -272,7 +298,7 @@ post '/track' do
     status = params[:status]
 
     logger.debug("For client #{from} settings status to #{status}")
-    mongoagents.update({_id: from} , { "$set" =>   {status: status,readytime: Time.now.to_f}})
+    update_agent(from, { status: status, readytime: Time.now.to_f })
 
     return ""
 end
@@ -283,11 +309,8 @@ get '/status' do
     logger.debug("Getting a /status request with params = #{params}")
     from = params[:from]
 
-    agentstatus = mongoagents.find_one ({_id: from})
-    if agentstatus
-       agentstatus = agentstatus["status"]
-    end
-    return agentstatus
+    agent = get_agent(from)
+    return agent[:status] || ""
 end
 
 post '/setcallerid' do
@@ -295,7 +318,7 @@ post '/setcallerid' do
     callerid = params[:callerid]
 
     logger.debug("Updating callerid for #{from} to #{callerid}")
-    mongoagents.update({_id: from} , { "$set" =>   {callerid: callerid}})
+    update_agent(from, { callerid: callerid })
 
     return ""
 end
@@ -305,14 +328,10 @@ get '/getcallerid' do
     from = params[:from]
 
     logger.debug("Getting callerid for #{from}")
-    callerid = ""
-    
-    agent = mongoagents.find_one ({_id: from})
-    if agent
-       callerid = agent["callerid"]
-    end
+    agent = get_agent(from)
+    callerid = agent[:callerid]
 
-    unless callerid
+    unless callerid && !callerid.empty?
       callerid = caller_id  #set to default env variable callerid
     end
 
@@ -338,8 +357,10 @@ post '/voicemail' do
 	    customer_call = @client.account.calls.get(callsid)
 	    # dl_id = "13614944241"
 	    dl_id = clid
-	    customer_call.update(:url => "http://yardidhruv-touchpoint.cs62.force.com/Click2Dial/VoiceMailDrop?uniqueid=#{dl_id}",
-			 :method => "POST")  
+	    if salesforce_webhook_url
+	      customer_call.update(:url => "#{salesforce_webhook_url.gsub('/TouchPoint', '/VoiceMailDrop')}?uniqueid=#{dl_id}",
+			   :method => "POST")
+	    end
 	    puts customer_call.to
 	#end
 end
@@ -403,26 +424,23 @@ end
 #Method that gets all "Ready" agents, sorts by longest idle (ie, the first availible) 
 # If callrouting == true, this function is being called from voice routing, and we want to select a "Ready" agent or a "DeQueing" agent
 
-def getlongestidle (callrouting, mongoagents) 
-
-   queryfor = []
-
-   if callrouting == true
-     queryfor = [ {status: "Ready"}, status: "DeQueing"]
-   else
-     queryfor = [ {status: "Ready"} ]
+def getlongestidle (callrouting) 
+   # Find agents with matching status
+   statuses = callrouting ? ["Ready", "DeQueing"] : ["Ready"]
+   
+   # Get all agents matching the status and sort by readytime
+   matching_agents = settings.agents.select do |name, agent|
+     statuses.include?(agent[:status])
    end
-
-   mongoreadyagent =  mongoagents.find_one( { "$query" => { "$or" => queryfor } , "$orderby" => {readytime: 1}  } )
-
-   mongolongestidleagent = ""
-   if mongoreadyagent
-      mongolongestidleagent = mongoreadyagent["_id"]
-   else
-      mongolongestidleagent = nil
-   end 
-   return mongolongestidleagent
-
+   
+   # Return the agent with the lowest (oldest) readytime
+   if matching_agents.empty?
+     return nil
+   end
+   
+   longest_idle = matching_agents.min_by { |name, agent| agent[:readytime] || Time.now.to_f }
+   return longest_idle[0] if longest_idle
+   return nil
 end
 
 
@@ -441,17 +459,17 @@ Thread.new do
      @members = queue1.members
      topmember =  @members.list.first 
 
-     mongoreadyagents = mongoagents.find({ status: "Ready"}).count()
-     readycount = mongoreadyagents || 0
+     # Count ready agents
+     readycount = settings.agents.count { |name, agent| agent[:status] == "Ready" }
 
      qsize =  account.queues.get(queueid).current_size
-    
+     
       if topmember #only check for availible agent if there is a caller in queue
         
-        bestclient = getlongestidle(false, mongoagents)
+        bestclient = getlongestidle(false)
         if bestclient
           logger.info("Found best client - routing to #{bestclient} - setting agent to DeQueuing status so they aren't sent another call from the queue")
-          mongoagents.update({_id: bestclient} , { "$set" =>   {status: "DeQueing" }  } )   
+          update_agent(bestclient, { status: "DeQueing" })
           topmember.dequeue(ENV['twilio_dqueue_url'])
         else 
           logger.debug("No Ready agents during queue poll # #{$sum}")
